@@ -9,7 +9,7 @@ use crate::{
         effect_ability_mechanic_map::get_ability_mechanic, shared_mutations, SimpleAction,
     },
     card_ids::CardId,
-    effects::TurnEffect,
+    effects::{CardEffect, TurnEffect},
     hooks::{
         get_counterattack_damage, modify_damage, on_attack_knockout, on_end_turn, on_knockout,
         should_poison_attacker,
@@ -465,17 +465,26 @@ pub(crate) fn handle_damage_only(
                 0
             }
         };
+        let reactive_attack_damage: u32 = target_pokemon
+            .get_effects()
+            .iter()
+            .filter_map(|(effect, _)| match effect {
+                CardEffect::ReactiveAttackDamageNextTurn { amount, .. } => Some(*amount),
+                _ => None,
+            })
+            .sum();
         let should_poison = should_poison_attacker(target_pokemon);
 
         // Apply counterattack damage and poison
-        if counter_damage > 0 {
+        let total_counter_damage = counter_damage + reactive_attack_damage;
+        if total_counter_damage > 0 {
             let attacking_pokemon = state.in_play_pokemon[attacking_player][0]
                 .as_mut()
                 .expect("Active Pokemon should be there");
-            attacking_pokemon.apply_damage(counter_damage);
+            attacking_pokemon.apply_damage(total_counter_damage);
             debug!(
                 "Dealt {} counterattack damage to active Pokemon. Remaining HP: {}",
-                counter_damage,
+                total_counter_damage,
                 attacking_pokemon.get_remaining_hp()
             );
         }
@@ -521,6 +530,7 @@ pub(crate) fn handle_knockouts(
     attacking_ref: (usize, usize), // (attacking_player, attacking_pokemon_idx)
     is_from_active_attack: bool,
 ) {
+    apply_perish_body_if_needed(state, attacking_ref, is_from_active_attack);
     let knockouts = get_knocked_out(state);
     let iris_bonus_active = is_iris_bonus_active(state, attacking_ref, is_from_active_attack);
 
@@ -614,6 +624,70 @@ pub(crate) fn handle_knockouts(
     }
 }
 
+fn apply_perish_body_if_needed(
+    state: &mut State,
+    _attacking_ref: (usize, usize),
+    is_from_active_attack: bool,
+) {
+    let Some(flip) = state.pending_perish_body_flip.as_ref() else {
+        return;
+    };
+    if !is_from_active_attack {
+        return;
+    }
+
+    let defender_was_knocked_out =
+        state
+            .enumerate_in_play_pokemon(flip.defender_player)
+            .any(|(idx, pokemon)| {
+                state.play_id(flip.defender_player, idx) == Some(flip.defender_play_id)
+                    && pokemon.is_knocked_out()
+                    && matches!(
+                        get_ability_mechanic(&pokemon.card),
+                        Some(AbilityMechanic::PerishBody)
+                    )
+            });
+    if !defender_was_knocked_out {
+        return;
+    }
+
+    let flip = state
+        .pending_perish_body_flip
+        .take()
+        .expect("Perish Body flip should still be pending");
+    if !flip.heads {
+        return;
+    }
+
+    let Some(attacker_idx) = state.find_play_id(flip.attacking_player, flip.attacker_play_id)
+    else {
+        return;
+    };
+    let Some(attacker) = state.in_play_pokemon[flip.attacking_player][attacker_idx].as_mut() else {
+        return;
+    };
+
+    debug!("Perish Body: heads, knocking out the attacking Pokemon");
+    attacker.knock_out();
+}
+
+fn resolve_deferred_attack_knockouts(state: &mut State) {
+    let Some(deferred) = state.deferred_attack_knockouts.take() else {
+        return;
+    };
+    let old_pending = state.pending_perish_body_flip.take();
+    state.pending_perish_body_flip = deferred.perish_body_flip;
+    let attacking_idx = state
+        .find_play_id(deferred.attacking_player, deferred.attacker_play_id)
+        .unwrap_or(0);
+    handle_knockouts(
+        state,
+        (deferred.attacking_player, attacking_idx),
+        deferred.is_from_active_attack,
+    );
+    state.pending_perish_body_flip = old_pending;
+}
+
 fn get_knocked_out(state: &State) -> Vec<(usize, usize)> {
     let mut knockouts: Vec<(usize, usize)> = vec![];
     for (idx, card) in state.enumerate_in_play_pokemon(0) {
@@ -660,6 +734,10 @@ pub(crate) fn wrap_with_common_logic(mutation: Mutation) -> Mutation {
         }
 
         mutation(rng, state, action); // in the case of attacks, have this be damage + effect.
+
+        if action.is_stack {
+            resolve_deferred_attack_knockouts(state);
+        }
 
         if let SimpleAction::Attack(_) = &action.action {
             // We use a flag instead of .move_generation_stack to reduce

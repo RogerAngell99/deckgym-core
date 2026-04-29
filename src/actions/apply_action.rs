@@ -9,11 +9,16 @@ use crate::{
         abilities::AbilityMechanic,
         apply_abilities_action::forecast_ability,
         apply_action_helpers::{wrap_with_common_logic, Mutation},
+        attacks::Mechanic,
+        effect_mechanic_map::EFFECT_MECHANIC_MAP,
         shared_mutations::{pokemon_search_outcomes, pokemon_search_outcomes_by_type_for_player},
     },
-    effects::TurnEffect,
-    hooks::{get_retreat_cost, on_evolve, to_playable_card},
-    models::{Card, EnergyType},
+    effects::{CardEffect, TurnEffect},
+    hooks::{
+        contains_energy, get_attack_cost, get_retreat_cost, modify_damage, on_evolve,
+        to_playable_card,
+    },
+    models::{Attack, Card, EnergyType},
     stadiums::{is_fragrant_forest_active, is_mesagoza_active},
     state::State,
     tools,
@@ -31,6 +36,7 @@ use super::{
 /// and then chooses one of them to apply. This is so that bot implementations can re-use the
 /// `forecast_action` function.
 pub fn apply_action(rng: &mut StdRng, state: &mut State, action: &Action) {
+    state.ensure_play_ids();
     let (probabilities, mut lazy_mutations) = forecast_action(state, action).into_branches();
     if probabilities.len() == 1 {
         lazy_mutations.remove(0)(rng, state, action);
@@ -54,7 +60,6 @@ pub fn forecast_action(state: &State, action: &Action) -> Outcomes {
         | SimpleAction::Evolve { .. }
         | SimpleAction::Activate { .. }
         | SimpleAction::Retreat(_)
-        | SimpleAction::ApplyDamage { .. }
         | SimpleAction::ScheduleDelayedSpotDamage { .. }
         | SimpleAction::Heal { .. }
         | SimpleAction::HealAndDiscardEnergy { .. }
@@ -67,20 +72,21 @@ pub fn forecast_action(state: &State, action: &Action) -> Outcomes {
         | SimpleAction::DiscardActiveStadium
         | SimpleAction::Noop => forecast_deterministic_action(),
         SimpleAction::UseAbility { in_play_idx } => forecast_ability(state, action, *in_play_idx),
-        SimpleAction::Attack(index) => forecast_attack(action.actor, state, *index),
+        SimpleAction::Attack(index) => forecast_attack_with_perish_body(state, action, *index),
         SimpleAction::UseCopiedAttack {
             source_player,
             source_in_play_idx,
             attack_index,
             require_attacker_energy_match,
-        } => forecast_copied_attack(
-            action.actor,
+        } => forecast_copied_attack_with_perish_body(
             state,
+            action,
             *source_player,
             *source_in_play_idx,
             *attack_index,
             *require_attacker_energy_match,
         ),
+        SimpleAction::ApplyDamage { .. } => forecast_apply_damage_action(state, action),
         SimpleAction::Play { trainer_card } => {
             forecast_trainer_action(action.actor, state, trainer_card)
         }
@@ -113,26 +119,31 @@ pub fn forecast_action(state: &State, action: &Action) -> Outcomes {
         // acting_player is not passed here, because there is only 1 turn to end. The current turn.
         SimpleAction::EndTurn => {
             let (probabilities, mutations) = forecast_end_turn(state);
-            Outcomes::from_parts(probabilities, mutations)
+            forecast_end_turn_with_optional_perish_body(
+                state,
+                action,
+                Outcomes::from_parts(probabilities, mutations),
+            )
         }
     };
 
     // This is where we basically "apply" Will in a way that is forecasteable.
     // (The player should know if they have an upcoming Will).
-    if is_will_eligible_action(&action.action) && state.has_pending_will_first_heads() {
-        outcomes = match outcomes.force_first_heads() {
-            Ok(forced_outcomes) => forced_outcomes.map_mutations(|mutation| {
-                Box::new(move |rng, state, action| {
-                    state.consume_pending_will_first_heads();
-                    mutation(rng, state, action);
-                })
-            }),
-            Err(original_outcomes) => original_outcomes,
-        };
+    if should_apply_will_after_forecast(&action.action) {
+        outcomes = apply_will_if_needed(state, action.actor, &action.action, outcomes);
     }
 
     // Wrap with common logic for mutations
     outcomes.map_mutations(wrap_with_common_logic)
+}
+
+fn should_apply_will_after_forecast(action: &SimpleAction) -> bool {
+    !matches!(
+        action,
+        SimpleAction::Attack(_)
+            | SimpleAction::UseCopiedAttack { .. }
+            | SimpleAction::ApplyDamage { .. }
+    )
 }
 
 fn is_will_eligible_action(action: &SimpleAction) -> bool {
@@ -144,6 +155,388 @@ fn is_will_eligible_action(action: &SimpleAction) -> bool {
             | SimpleAction::Play { .. }
             | SimpleAction::UseStadium
     )
+}
+
+fn apply_will_if_needed(
+    state: &State,
+    player: usize,
+    action: &SimpleAction,
+    outcomes: Outcomes,
+) -> Outcomes {
+    if !is_will_eligible_action(action) || !state.has_pending_will_first_heads(player) {
+        return outcomes;
+    }
+
+    match outcomes.force_first_heads() {
+        Ok(forced_outcomes) => forced_outcomes.map_mutations(|mutation| {
+            Box::new(move |rng, state, action| {
+                state.consume_pending_will_first_heads(player);
+                mutation(rng, state, action);
+            })
+        }),
+        Err(original_outcomes) => original_outcomes,
+    }
+}
+
+fn forecast_attack_with_perish_body(state: &State, action: &Action, index: usize) -> Outcomes {
+    forecast_with_optional_perish_body(state, action, || {
+        forecast_attack(action.actor, state, index)
+    })
+}
+
+fn forecast_copied_attack_with_perish_body(
+    state: &State,
+    action: &Action,
+    source_player: usize,
+    source_in_play_idx: usize,
+    attack_index: usize,
+    require_attacker_energy_match: bool,
+) -> Outcomes {
+    forecast_with_optional_perish_body(state, action, || {
+        forecast_copied_attack(
+            action.actor,
+            state,
+            source_player,
+            source_in_play_idx,
+            attack_index,
+            require_attacker_energy_match,
+        )
+    })
+}
+
+fn forecast_apply_damage_action(state: &State, action: &Action) -> Outcomes {
+    forecast_with_optional_perish_body(state, action, forecast_deterministic_action)
+}
+
+fn forecast_with_optional_perish_body(
+    state: &State,
+    action: &Action,
+    mut make_outcomes: impl FnMut() -> Outcomes,
+) -> Outcomes {
+    let Some(context) = perish_body_attack_context(state, action) else {
+        return apply_will_if_needed(state, action.actor, &action.action, make_outcomes());
+    };
+
+    let heads = apply_will_if_needed(state, action.actor, &action.action, make_outcomes());
+    let tails = apply_will_if_needed(state, action.actor, &action.action, make_outcomes());
+    combine_perish_body_flip(state, heads, tails, context)
+}
+
+fn forecast_end_turn_with_optional_perish_body(
+    state: &State,
+    action: &Action,
+    outcomes: Outcomes,
+) -> Outcomes {
+    let Some(context) = perish_body_end_turn_context(state, action.actor) else {
+        return outcomes;
+    };
+    let tails = clone_end_turn_outcomes_for_perish(state, action);
+    combine_perish_body_flip(state, outcomes, tails, context)
+}
+
+fn clone_end_turn_outcomes_for_perish(state: &State, action: &Action) -> Outcomes {
+    let (probabilities, mutations) = forecast_end_turn(state);
+    let outcomes = Outcomes::from_parts(probabilities, mutations);
+    if should_apply_will_after_forecast(&action.action) {
+        apply_will_if_needed(state, action.actor, &action.action, outcomes)
+    } else {
+        outcomes
+    }
+}
+
+#[derive(Clone)]
+struct PerishBodyContext {
+    attacking_player: usize,
+    attacker_play_id: u64,
+    defender_player: usize,
+    defender_play_id: u64,
+    allow_will: bool,
+}
+
+fn combine_perish_body_flip(
+    state: &State,
+    heads: Outcomes,
+    tails: Outcomes,
+    context: PerishBodyContext,
+) -> Outcomes {
+    let can_force_perish = context.allow_will
+        && !heads.has_coin_paths()
+        && state.has_pending_will_first_heads(context.defender_player);
+    let (head_probs, head_mutations) = heads.into_branches();
+    let (tail_probs, tail_mutations) = tails.into_branches();
+    let total_branches = head_probs.len() + tail_probs.len();
+    let mut probabilities = Vec::with_capacity(total_branches);
+    let mut mutations: Mutations = Vec::with_capacity(total_branches);
+
+    for (probability, mutation) in head_probs.into_iter().zip(head_mutations) {
+        probabilities.push(probability * 0.5);
+        mutations.push(perish_body_flip_mutation(mutation, true, context.clone()));
+    }
+    for (probability, mutation) in tail_probs.into_iter().zip(tail_mutations) {
+        probabilities.push(probability * 0.5);
+        mutations.push(perish_body_flip_mutation(mutation, false, context.clone()));
+    }
+
+    let outcomes = if can_force_perish {
+        let mut coin_branches = Vec::with_capacity(total_branches);
+        let mut mutations = mutations.into_iter();
+        for probability in probabilities {
+            let mutation = mutations
+                .next()
+                .expect("Perish Body probabilities and mutations should match");
+            let heads = coin_branches.len() < total_branches / 2;
+            coin_branches.push((probability, mutation, vec![CoinSeq(vec![heads])]));
+        }
+        Outcomes::from_coin_branches(coin_branches)
+            .expect("Perish Body coin branches should be valid")
+    } else {
+        Outcomes::from_parts(probabilities, mutations)
+    };
+
+    if can_force_perish {
+        match outcomes.force_first_heads() {
+            Ok(forced) => forced.map_mutations(move |mutation| {
+                Box::new(move |rng, state, action| {
+                    state.consume_pending_will_first_heads(context.defender_player);
+                    mutation(rng, state, action);
+                })
+            }),
+            Err(original) => original,
+        }
+    } else {
+        outcomes
+    }
+}
+
+fn perish_body_flip_mutation(
+    mutation: Mutation,
+    heads: bool,
+    context: PerishBodyContext,
+) -> Mutation {
+    Box::new(move |rng, state, action| {
+        state.set_pending_perish_body_flip(
+            heads,
+            context.attacking_player,
+            context.attacker_play_id,
+            context.defender_player,
+            context.defender_play_id,
+        );
+        mutation(rng, state, action);
+        state.clear_pending_perish_body_flip();
+    })
+}
+
+fn perish_body_attack_context(state: &State, action: &Action) -> Option<PerishBodyContext> {
+    match &action.action {
+        SimpleAction::Attack(index) => {
+            let active = state.in_play_pokemon[action.actor][0].as_ref()?;
+            let attack = active.get_attacks().get(*index)?;
+            perish_body_context_for_attack(state, action.actor, attack)
+                .or_else(|| perish_body_context_for_reactive_attack_damage(state, action.actor))
+        }
+        SimpleAction::UseCopiedAttack {
+            source_player,
+            source_in_play_idx,
+            attack_index,
+            require_attacker_energy_match,
+        } => {
+            if *require_attacker_energy_match {
+                let active = state.in_play_pokemon[action.actor][0].as_ref()?;
+                let source = state.in_play_pokemon[*source_player][*source_in_play_idx].as_ref()?;
+                let attack = source.get_attacks().get(*attack_index)?;
+                let modified_cost = get_attack_cost(&attack.energy_required, state, action.actor);
+                if !contains_energy(active, &modified_cost, state, action.actor) {
+                    return None;
+                }
+            }
+            let source = state.in_play_pokemon[*source_player][*source_in_play_idx].as_ref()?;
+            let attack = source.get_attacks().get(*attack_index)?;
+            perish_body_context_for_attack(state, action.actor, attack)
+                .or_else(|| perish_body_context_for_reactive_attack_damage(state, action.actor))
+        }
+        SimpleAction::ApplyDamage {
+            attacking_ref,
+            targets,
+            is_from_active_attack,
+        } => {
+            if !*is_from_active_attack || attacking_ref.1 != 0 {
+                return None;
+            }
+            let defender_player = (attacking_ref.0 + 1) % 2;
+            let active_damage = targets
+                .iter()
+                .filter(|(_, target_player, target_idx)| {
+                    *target_player == defender_player && *target_idx == 0
+                })
+                .map(|(damage, _, _)| *damage)
+                .sum::<u32>();
+            perish_body_context_for_active_damage(
+                state,
+                attacking_ref.0,
+                defender_player,
+                active_damage,
+                None,
+                false,
+            )
+        }
+        _ => None,
+    }
+}
+
+fn perish_body_context_for_attack(
+    state: &State,
+    attacking_player: usize,
+    attack: &Attack,
+) -> Option<PerishBodyContext> {
+    let defender_player = (attacking_player + 1) % 2;
+    let base_damage = perish_body_relevant_attack_damage(state, attacking_player, attack);
+    perish_body_context_for_active_damage(
+        state,
+        attacking_player,
+        defender_player,
+        base_damage,
+        Some(&attack.title),
+        false,
+    )
+}
+
+fn perish_body_context_for_active_damage(
+    state: &State,
+    attacking_player: usize,
+    defender_player: usize,
+    base_damage: u32,
+    attack_name: Option<&str>,
+    allow_will: bool,
+) -> Option<PerishBodyContext> {
+    if base_damage == 0 || attacking_player == defender_player {
+        return None;
+    }
+
+    let _attacker = state.in_play_pokemon[attacking_player][0].as_ref()?;
+    let defender = state.in_play_pokemon[defender_player][0].as_ref()?;
+    if defender.is_knocked_out()
+        || !has_ability_mechanic(&defender.card, &AbilityMechanic::PerishBody)
+    {
+        return None;
+    }
+
+    let modified_damage = modify_damage(
+        state,
+        (attacking_player, 0),
+        (base_damage, defender_player, 0),
+        true,
+        attack_name,
+    );
+    if modified_damage == 0 || modified_damage < defender.get_remaining_hp() {
+        return None;
+    }
+
+    let attacker_play_id = state.play_id(attacking_player, 0)?;
+    let defender_play_id = state.play_id(defender_player, 0)?;
+    Some(PerishBodyContext {
+        attacking_player,
+        attacker_play_id,
+        defender_player,
+        defender_play_id,
+        allow_will,
+    })
+}
+
+fn perish_body_relevant_attack_damage(
+    state: &State,
+    attacking_player: usize,
+    attack: &Attack,
+) -> u32 {
+    let mut damage = attack.fixed_damage;
+    let Some(effect_text) = attack.effect.as_deref() else {
+        return damage;
+    };
+    let Some(mechanic) = EFFECT_MECHANIC_MAP.get(effect_text) else {
+        return damage;
+    };
+    let active = state.get_active(attacking_player);
+    match mechanic {
+        Mechanic::ExtraDamageIfMovedFromBench { extra_damage }
+            if active.moved_to_active_this_turn =>
+        {
+            damage += extra_damage;
+        }
+        Mechanic::ExtraDamageIfEvolvedThisTurn { extra_damage } if active.played_this_turn => {
+            damage += extra_damage;
+        }
+        Mechanic::ExtraDamageIfToolAttached { extra_damage } if active.attached_tool.is_some() => {
+            damage += extra_damage;
+        }
+        _ => {}
+    }
+    damage
+}
+
+fn perish_body_context_for_reactive_attack_damage(
+    state: &State,
+    attacking_player: usize,
+) -> Option<PerishBodyContext> {
+    let defender_player = (attacking_player + 1) % 2;
+    let attacker = state.in_play_pokemon[attacking_player][0].as_ref()?;
+    if attacker.is_knocked_out()
+        || !has_ability_mechanic(&attacker.card, &AbilityMechanic::PerishBody)
+    {
+        return None;
+    }
+    let defender = state.in_play_pokemon[defender_player][0].as_ref()?;
+    let attacker_remaining_hp = attacker.get_remaining_hp();
+    defender
+        .get_effects()
+        .iter()
+        .find_map(|(effect, _)| match effect {
+            CardEffect::ReactiveAttackDamageNextTurn {
+                amount,
+                source_player,
+                source_play_id,
+                ..
+            } if *amount >= attacker_remaining_hp && *source_player == defender_player => {
+                Some(PerishBodyContext {
+                    attacking_player: *source_player,
+                    attacker_play_id: *source_play_id,
+                    defender_player: attacking_player,
+                    defender_play_id: state.play_id(attacking_player, 0)?,
+                    allow_will: true,
+                })
+            }
+            _ => None,
+        })
+}
+
+fn perish_body_end_turn_context(
+    state: &State,
+    player_ending_turn: usize,
+) -> Option<PerishBodyContext> {
+    let active = state.in_play_pokemon[player_ending_turn][0].as_ref()?;
+    if active.is_knocked_out() || !has_ability_mechanic(&active.card, &AbilityMechanic::PerishBody)
+    {
+        return None;
+    }
+
+    active
+        .get_effects()
+        .iter()
+        .find_map(|(effect, _)| match effect {
+            CardEffect::DelayedAttackDamage {
+                amount,
+                source_player,
+                source_play_id,
+                ..
+            } if *source_player != player_ending_turn && *amount >= active.get_remaining_hp() => {
+                Some(PerishBodyContext {
+                    attacking_player: *source_player,
+                    attacker_play_id: *source_play_id,
+                    defender_player: player_ending_turn,
+                    defender_play_id: state.play_id(player_ending_turn, 0)?,
+                    allow_will: true,
+                })
+            }
+            _ => None,
+        })
 }
 
 fn forecast_deterministic_action() -> Outcomes {
@@ -334,6 +727,7 @@ pub(crate) fn apply_place_card(
 ) {
     let played_card = to_playable_card(card, true);
     state.in_play_pokemon[actor][index] = Some(played_card);
+    state.assign_new_play_id(actor, index);
     state.refresh_starting_plains_bonus_for_idx(actor, index);
     // SoothingWind (Ogerpon ex) / Flower Shield (Comfey): cure status conditions on entry.
     if let Some(AbilityMechanic::SoothingWind { energy_type }) = get_ability_mechanic(card) {
@@ -365,6 +759,7 @@ fn apply_return_pokemon_to_hand(acting_player: usize, state: &mut State, in_play
     let played_card = state.in_play_pokemon[acting_player][in_play_idx]
         .take()
         .expect("Pokemon should be there if returning to hand");
+    state.clear_play_id(acting_player, in_play_idx);
     let mut cards_to_collect = played_card.cards_behind.clone();
     cards_to_collect.push(played_card.card.clone());
     state.hands[acting_player].extend(cards_to_collect);
@@ -498,7 +893,7 @@ fn apply_retreat(player: usize, state: &mut State, bench_idx: usize, is_free: bo
         }
     }
 
-    state.in_play_pokemon[player].swap(0, bench_idx);
+    state.swap_in_play(player, 0, bench_idx);
 
     // Clear status and effects of the new bench Pokemon
     if let Some(pokemon) = state.in_play_pokemon[player][bench_idx].as_mut() {
