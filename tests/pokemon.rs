@@ -34,8 +34,12 @@ mod galarian_cursola_perish_body_test;
 mod gallade_test;
 #[path = "pokemon/grovyle_slicing_snipe_test.rs"]
 mod grovyle_slicing_snipe_test;
+#[path = "pokemon/houndstone_last_respects_test.rs"]
+mod houndstone_last_respects_test;
 #[path = "pokemon/jolteon_ex_test.rs"]
 mod jolteon_ex_test;
+#[path = "pokemon/klefki_dismantling_keys_test.rs"]
+mod klefki_dismantling_keys_test;
 #[path = "pokemon/legacy_ability_logic_test.rs"]
 mod legacy_ability_logic_test;
 #[path = "pokemon/lucario_b3_test.rs"]
