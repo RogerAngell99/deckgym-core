@@ -124,6 +124,7 @@ pub enum Mechanic {
         damage: u32,
         bench_only: bool,
     },
+    DamageUnaffectedByWeakness,
     DamageAndTurnEffect {
         effect: TurnEffect,
         duration: u8,

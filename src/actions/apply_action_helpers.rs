@@ -11,8 +11,8 @@ use crate::{
     card_ids::CardId,
     effects::{CardEffect, TurnEffect},
     hooks::{
-        get_counterattack_damage, modify_damage, on_attack_knockout, on_end_turn, on_knockout,
-        should_poison_attacker,
+        get_counterattack_damage, modify_damage_with_options, on_attack_knockout, on_end_turn,
+        on_knockout, should_poison_attacker, DamageOptions,
     },
     models::{Card, StatusCondition, TrainerType},
     state::GameOutcome,
@@ -397,6 +397,24 @@ pub(crate) fn handle_damage_only(
     is_from_active_attack: bool,
     attack_name: Option<&str>,
 ) {
+    handle_damage_only_with_options(
+        state,
+        attacking_ref,
+        targets,
+        is_from_active_attack,
+        attack_name,
+        DamageOptions::default(),
+    );
+}
+
+pub(crate) fn handle_damage_only_with_options(
+    state: &mut State,
+    attacking_ref: (usize, usize), // (attacking_player, attacking_pokemon_idx)
+    targets: &[(u32, usize, usize)], // damage, target_player, in_play_idx
+    is_from_active_attack: bool,
+    attack_name: Option<&str>,
+    damage_options: DamageOptions,
+) {
     let attacking_player = attacking_ref.0;
 
     // Reduce and sum damage for duplicate targets
@@ -413,12 +431,13 @@ pub(crate) fn handle_damage_only(
     let modified_targets = targets
         .iter()
         .map(|target_ref| {
-            let modified_damage = modify_damage(
+            let modified_damage = modify_damage_with_options(
                 state,
                 attacking_ref,
                 *target_ref,
                 is_from_active_attack,
                 attack_name,
+                damage_options,
             );
             (modified_damage, target_ref.1, target_ref.2)
         })

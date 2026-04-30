@@ -1,7 +1,8 @@
 use rand::rngs::StdRng;
 
 use crate::{
-    actions::apply_action_helpers::{handle_damage_only, handle_knockouts},
+    actions::apply_action_helpers::{handle_damage_only_with_options, handle_knockouts},
+    hooks::DamageOptions,
     models::StatusCondition,
     State,
 };
@@ -19,6 +20,10 @@ use super::{
 // Useful for deterministic attacks
 pub(crate) fn active_damage_doutcome(damage: u32) -> Outcomes {
     active_damage_effect_doutcome(damage, |_, _, _| {})
+}
+
+pub(crate) fn active_damage_ignore_weakness_doutcome(damage: u32) -> Outcomes {
+    Outcomes::single(active_damage_ignore_weakness_mutation(damage))
 }
 
 pub(crate) fn active_damage_effect_doutcome(
@@ -43,6 +48,16 @@ pub(crate) fn active_damage_mutation(damage: u32) -> Mutation {
     damage_effect_mutation(vec![(damage, 0)], |_, _, _| {})
 }
 
+pub(crate) fn active_damage_ignore_weakness_mutation(damage: u32) -> Mutation {
+    damage_effect_mutation_with_options(
+        vec![(damage, 0)],
+        |_, _, _| {},
+        DamageOptions {
+            ignore_weakness: true,
+        },
+    )
+}
+
 pub(crate) fn active_damage_effect_mutation(
     damage: u32,
     additional_effect: impl Fn(&mut StdRng, &mut State, &Action) + 'static,
@@ -53,6 +68,17 @@ pub(crate) fn active_damage_effect_mutation(
 pub(crate) fn damage_effect_mutation<F>(
     targets: Vec<(u32, usize)>,
     additional_effect: F,
+) -> Mutation
+where
+    F: Fn(&mut StdRng, &mut State, &Action) + 'static,
+{
+    damage_effect_mutation_with_options(targets, additional_effect, DamageOptions::default())
+}
+
+fn damage_effect_mutation_with_options<F>(
+    targets: Vec<(u32, usize)>,
+    additional_effect: F,
+    damage_options: DamageOptions,
 ) -> Mutation
 where
     F: Fn(&mut StdRng, &mut State, &Action) + 'static,
@@ -101,12 +127,13 @@ where
 
             let attacking_ref = (action.actor, 0);
             let is_from_active_attack = true;
-            handle_damage_only(
+            handle_damage_only_with_options(
                 state,
                 attacking_ref,
                 &targets,
                 is_from_active_attack,
                 Some(&attack_name),
+                damage_options,
             );
             additional_effect(rng, state, action);
             handle_knockouts(state, attacking_ref, is_from_active_attack);
