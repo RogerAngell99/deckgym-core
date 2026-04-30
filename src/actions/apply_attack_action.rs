@@ -27,7 +27,8 @@ use super::{
     apply_action_helpers::{Mutation, Mutations},
     mutations::{
         active_damage_doutcome, active_damage_effect_doutcome, active_damage_effect_mutation,
-        active_damage_mutation, build_status_effect, damage_effect_doutcome,
+        active_damage_ignore_weakness_doutcome, active_damage_mutation, build_status_effect,
+        damage_effect_doutcome,
     },
     outcomes::{CoinSeq, Outcomes},
     shared_mutations::{
@@ -368,6 +369,9 @@ fn forecast_effect_attack_by_mechanic(
             both_heads_bonus_damage_attack(attack.fixed_damage, *extra_damage)
         }
         Mechanic::DirectDamage { damage, bench_only } => direct_damage(*damage, *bench_only),
+        Mechanic::DamageUnaffectedByWeakness => {
+            active_damage_ignore_weakness_doutcome(attack.fixed_damage)
+        }
         Mechanic::DamageAndTurnEffect { effect, duration } => {
             damage_and_turn_effect_attack(attack.fixed_damage, effect.clone(), *duration)
         }

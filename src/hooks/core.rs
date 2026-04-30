@@ -773,13 +773,37 @@ fn get_weakness_modifier(
     0
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DamageOptions {
+    pub(crate) ignore_weakness: bool,
+}
+
 // TODO: Confirm is_from_attack and goes to enemy active
+#[cfg(test)]
 pub(crate) fn modify_damage(
     state: &State,
     attacking_ref: (usize, usize),
     target_ref: (u32, usize, usize),
     is_from_active_attack: bool,
     attack_name: Option<&str>,
+) -> u32 {
+    modify_damage_with_options(
+        state,
+        attacking_ref,
+        target_ref,
+        is_from_active_attack,
+        attack_name,
+        DamageOptions::default(),
+    )
+}
+
+pub(crate) fn modify_damage_with_options(
+    state: &State,
+    attacking_ref: (usize, usize),
+    target_ref: (u32, usize, usize),
+    is_from_active_attack: bool,
+    attack_name: Option<&str>,
+    damage_options: DamageOptions,
 ) -> u32 {
     // If attack is 0, not even Giovanni takes it to 10.
     let (attacking_player, attacking_idx) = attacking_ref;
@@ -879,13 +903,18 @@ pub(crate) fn modify_damage(
         attacking_player,
         is_from_active_attack,
     );
-    let weakness_modifier = get_weakness_modifier(
-        state,
-        is_active_to_active,
-        target_player,
-        attacking_pokemon,
-        base_damage,
-    );
+    let weakness_modifier = if damage_options.ignore_weakness {
+        debug!("Attack ignores Weakness: Ignoring weakness damage");
+        0
+    } else {
+        get_weakness_modifier(
+            state,
+            is_active_to_active,
+            target_player,
+            attacking_pokemon,
+            base_damage,
+        )
+    };
 
     // Type-specific damage boost abilities (e.g., Lucario's Fighting Coach, Aegislash's Royal Command)
     // These check if certain ability-holders are in play and boost damage for specific energy types

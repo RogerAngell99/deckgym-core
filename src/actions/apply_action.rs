@@ -15,8 +15,8 @@ use crate::{
     },
     effects::{CardEffect, TurnEffect},
     hooks::{
-        contains_energy, get_attack_cost, get_retreat_cost, modify_damage, on_evolve,
-        to_playable_card,
+        contains_energy, get_attack_cost, get_retreat_cost, modify_damage_with_options, on_evolve,
+        to_playable_card, DamageOptions,
     },
     models::{Attack, Card, EnergyType},
     stadiums::{is_fragrant_forest_active, is_mesagoza_active},
@@ -376,6 +376,7 @@ fn perish_body_attack_context(state: &State, action: &Action) -> Option<PerishBo
                 defender_player,
                 active_damage,
                 None,
+                DamageOptions::default(),
                 false,
             )
         }
@@ -390,12 +391,14 @@ fn perish_body_context_for_attack(
 ) -> Option<PerishBodyContext> {
     let defender_player = (attacking_player + 1) % 2;
     let base_damage = perish_body_relevant_attack_damage(state, attacking_player, attack);
+    let damage_options = damage_options_for_attack(attack);
     perish_body_context_for_active_damage(
         state,
         attacking_player,
         defender_player,
         base_damage,
         Some(&attack.title),
+        damage_options,
         false,
     )
 }
@@ -406,6 +409,7 @@ fn perish_body_context_for_active_damage(
     defender_player: usize,
     base_damage: u32,
     attack_name: Option<&str>,
+    damage_options: DamageOptions,
     allow_will: bool,
 ) -> Option<PerishBodyContext> {
     if base_damage == 0 || attacking_player == defender_player {
@@ -420,12 +424,13 @@ fn perish_body_context_for_active_damage(
         return None;
     }
 
-    let modified_damage = modify_damage(
+    let modified_damage = modify_damage_with_options(
         state,
         (attacking_player, 0),
         (base_damage, defender_player, 0),
         true,
         attack_name,
+        damage_options,
     );
     if modified_damage == 0 || modified_damage < defender.get_remaining_hp() {
         return None;
@@ -440,6 +445,18 @@ fn perish_body_context_for_active_damage(
         defender_play_id,
         allow_will,
     })
+}
+
+fn damage_options_for_attack(attack: &Attack) -> DamageOptions {
+    let Some(effect_text) = attack.effect.as_deref() else {
+        return DamageOptions::default();
+    };
+    match EFFECT_MECHANIC_MAP.get(effect_text) {
+        Some(Mechanic::DamageUnaffectedByWeakness) => DamageOptions {
+            ignore_weakness: true,
+        },
+        _ => DamageOptions::default(),
+    }
 }
 
 fn perish_body_relevant_attack_damage(
