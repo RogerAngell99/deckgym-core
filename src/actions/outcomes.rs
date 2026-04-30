@@ -167,6 +167,12 @@ impl Outcomes {
         Self { branches }
     }
 
+    pub fn has_coin_paths(&self) -> bool {
+        self.branches
+            .iter()
+            .any(|branch| !matches!(branch.coin_paths, CoinPaths::None))
+    }
+
     /// Forces the first coin in each coin-path branch to be heads.
     ///
     /// Returns:
