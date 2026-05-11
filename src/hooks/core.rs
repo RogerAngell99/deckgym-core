@@ -731,26 +731,30 @@ fn get_turn_effect_damage_reduction(
         .sum::<u32>()
 }
 
-fn get_weakness_modifier(
+enum WeaknessApplication {
+    None,
+    Flat(u32),
+    Double,
+}
+
+fn get_weakness_application(
     state: &State,
     is_active_to_active: bool,
     target_player: usize,
     attacking_pokemon: &crate::models::PlayedCard,
-    base_damage: u32,
-) -> u32 {
+) -> WeaknessApplication {
     if !is_active_to_active {
-        return 0;
+        return WeaknessApplication::None;
     }
     let receiving = state.get_active(target_player);
 
-    // Check if defender has NoWeakness effect active
     if receiving
         .get_active_effects()
         .iter()
         .any(|effect| matches!(effect, CardEffect::NoWeakness))
     {
         debug!("NoWeakness: Ignoring weakness damage");
-        return 0;
+        return WeaknessApplication::None;
     }
 
     if let Card::Pokemon(pokemon_card) = &receiving.card {
@@ -760,17 +764,17 @@ fn get_weakness_modifier(
                 pokemon_card,
                 attacking_pokemon.card.get_type()
             );
-            // Bounded Field: apply weakness as ×2 for non-Mega-Evolution-ex attackers
+            // Bounded Field: ×2 all damage (including other modifiers) for non-Mega-ex attackers
             if is_bounded_field_active(state)
                 && !(attacking_pokemon.card.is_mega() && attacking_pokemon.card.is_ex())
             {
-                debug!("Bounded Field: Applying weakness as ×2");
-                return base_damage;
+                debug!("Bounded Field: Applying weakness as ×2 of total damage");
+                return WeaknessApplication::Double;
             }
-            return 20;
+            return WeaknessApplication::Flat(20);
         }
     }
-    0
+    WeaknessApplication::None
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -903,17 +907,11 @@ pub(crate) fn modify_damage_with_options(
         attacking_player,
         is_from_active_attack,
     );
-    let weakness_modifier = if damage_options.ignore_weakness {
+    let weakness_application = if damage_options.ignore_weakness {
         debug!("Attack ignores Weakness: Ignoring weakness damage");
-        0
+        WeaknessApplication::None
     } else {
-        get_weakness_modifier(
-            state,
-            is_active_to_active,
-            target_player,
-            attacking_pokemon,
-            base_damage,
-        )
+        get_weakness_application(state, is_active_to_active, target_player, attacking_pokemon)
     };
 
     // Type-specific damage boost abilities (e.g., Lucario's Fighting Coach, Aegislash's Royal Command)
@@ -942,9 +940,8 @@ pub(crate) fn modify_damage_with_options(
     };
 
     debug!(
-        "Attack: {:?}, Weakness: {}, IncreasedDamage: {}, IncreasedAttackSpecific: {}, IncreasedVulnerability: {}, ReducedDamage: {}, TurnEffectReduction: {}, HeavyHelmet: {}, MetalCoreBarrier: {}, SteelApron: {}, IntimidatingFang: {}, AbilityReduction: {}, AbilityIncrease: {}, TypeBoost: {}, StadiumBonus: {}",
+        "Attack: {:?}, IncreasedDamage: {}, IncreasedAttackSpecific: {}, IncreasedVulnerability: {}, ReducedDamage: {}, TurnEffectReduction: {}, HeavyHelmet: {}, MetalCoreBarrier: {}, SteelApron: {}, IntimidatingFang: {}, AbilityReduction: {}, AbilityIncrease: {}, TypeBoost: {}, StadiumBonus: {}",
         base_damage,
-        weakness_modifier,
         increased_turn_effect_modifiers,
         increased_attack_specific_modifiers,
         increased_vulnerability_modifiers,
@@ -959,8 +956,7 @@ pub(crate) fn modify_damage_with_options(
         type_boost_bonus,
         stadium_damage_bonus
     );
-    (base_damage
-        + weakness_modifier
+    let pre_weakness = (base_damage
         + ability_damage_increase
         + increased_turn_effect_modifiers
         + increased_attack_specific_modifiers
@@ -975,7 +971,12 @@ pub(crate) fn modify_damage_with_options(
                 + steel_apron_reduction
                 + intimidating_fang_reduction
                 + ability_damage_reduction,
-        )
+        );
+    match weakness_application {
+        WeaknessApplication::None => pre_weakness,
+        WeaknessApplication::Flat(amount) => pre_weakness + amount,
+        WeaknessApplication::Double => pre_weakness * 2,
+    }
 }
 
 /// Calculate type-specific damage boost from abilities like Lucario's Fighting Coach or Aegislash's Royal Command
